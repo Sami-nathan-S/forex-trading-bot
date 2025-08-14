@@ -1,0 +1,529 @@
+//+------------------------------------------------------------------+
+//|              SelvaAbi RSI Hedge Bot (MT5) - v2.0                 |
+//|   ✅ Floating Profit Target Input + Trade Count + RSI Status     |
+//+------------------------------------------------------------------+
+#import "MetaTrader5"
+#import "datetime"
+#import
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+bool startedtrade = false;
+int rsiHandle = INVALID_HANDLE;
+
+// Hardcoded RSI and expiry settings
+int RSI_Period = 9;
+int RSI_Overbought = 70;
+int RSI_Oversold = 30;
+ENUM_APPLIED_PRICE RSI_Price = PRICE_CLOSE;
+string ExpiryDate = "2028.05.03 00:00:01";
+
+input double ProfitTarget = 1.0;  // 💰 Target profit per cycle in dollars
+bool volumeAlreadyIncremented = false;
+
+
+
+
+double rsiValue;
+double volumeSequence[20];  // dynamically generated based on ProfitTarget
+
+int volumeIndex = 0;
+
+
+bool firstorderplaced = true;
+
+double sl = 0.0;
+double tp = 0.0;
+double changer = 2.6;
+bool closecode = false;
+int precision = 1000;
+int count = 1;
+
+ulong last_order;
+int total_trades = 0;  // 🧮 Count trades
+
+string currency = _Symbol;
+
+
+
+int _initial_ordered = false;
+int p_min = -1;
+
+
+
+int p_orders = OrdersTotal();
+int p_position = PositionsTotal();
+
+// ✅ Fixed: Get total floating profit
+double GetTotalProfit()
+{
+   double totalProfit = 0.0;
+   int total = PositionsTotal();
+   for (int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if (PositionSelectByTicket(ticket))
+         totalProfit += PositionGetDouble(POSITION_PROFIT);
+   }
+   return totalProfit;
+}
+
+void Closeallorders()
+{
+   for (int j = OrdersTotal() - 1; j >= 0; j--)
+   {
+      ulong ticket = OrderGetTicket(j);
+if (OrderSelect(ticket))
+
+      {
+         ulong ticket = OrderGetTicket(j);
+         trade.OrderDelete(ticket);
+      }
+   }
+}
+
+void CloseAllPositions()
+{
+   int totalPositions = PositionsTotal();
+   for (int i = totalPositions - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if (PositionSelectByTicket(ticket))
+      {
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         long positionType = PositionGetInteger(POSITION_TYPE);
+         double lotSize = PositionGetDouble(POSITION_VOLUME);
+         ENUM_ORDER_TYPE orderType = (positionType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+         double price = (orderType == ORDER_TYPE_SELL) ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+
+         MqlTradeRequest request;
+         MqlTradeResult result;
+         ZeroMemory(request);
+         ZeroMemory(result);
+
+         request.action = TRADE_ACTION_DEAL;
+         request.symbol = symbol;
+         request.volume = lotSize;
+         request.type = orderType;
+         request.price = price;
+         request.deviation = 10;
+         request.comment = "Close position";
+         request.position = ticket;
+
+         if (!OrderSend(request, result) || result.retcode != TRADE_RETCODE_DONE)
+{
+   Print("❌ OrderSend failed: ", result.retcode, " - ", result.comment);
+}
+else
+{
+   Print("✅ Order placed successfully. Ticket: ", result.order);
+}
+
+      }
+   }
+}
+
+void CloseAllTrades()
+{
+   // --- Close all open positions
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if (PositionSelectByTicket(ticket))
+      {
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         double volume = PositionGetDouble(POSITION_VOLUME);
+         ulong magic = PositionGetInteger(POSITION_MAGIC);
+         int type = (int)PositionGetInteger(POSITION_TYPE);
+
+         if (type == POSITION_TYPE_BUY)
+            trade.PositionClose(ticket);
+         else if (type == POSITION_TYPE_SELL)
+            trade.PositionClose(ticket);
+      }
+   }
+
+   // --- Delete all pending orders
+   for (int j = OrdersTotal() - 1; j >= 0; j--)
+   {
+      ulong ticket = OrderGetTicket(j);
+if (OrderSelect(ticket))
+
+      {
+         ulong ticket = OrderGetTicket(j);
+         trade.OrderDelete(ticket);
+      }
+   }
+}
+
+MqlTradeResult PlacePendingOrder(ENUM_TRADE_REQUEST_ACTIONS action, ENUM_ORDER_TYPE type, string symbol, double price, ulong order)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+
+   double vols = volumeSequence[volumeIndex]; // ✅ Always use fixed sequence
+
+   request.action = action;
+   request.symbol = symbol;
+   request.type_filling = ORDER_FILLING_IOC;
+
+
+   if (action != TRADE_ACTION_SLTP)
+   {
+      request.volume = vols;
+      request.type = type;
+      request.magic = 123456;
+
+      request.price = (_initial_ordered)
+         ? price
+         : (type == ORDER_TYPE_BUY || type == ORDER_TYPE_BUY_STOP)
+            ? SymbolInfoDouble(symbol, SYMBOL_ASK)
+            : SymbolInfoDouble(symbol, SYMBOL_BID);
+   }
+
+   if (action == TRADE_ACTION_SLTP)
+   {
+      request.sl = price - sl;
+      request.tp = price + tp;
+      request.position = order;
+   }
+
+   OrderSend(request, result);
+
+   
+
+   return result;
+}
+
+// ✅ New function to place order with custom volume
+MqlTradeResult PlacePendingOrderWithCustomVolume(ENUM_TRADE_REQUEST_ACTIONS action, ENUM_ORDER_TYPE type, string symbol, double price, ulong order, double customVolume)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+
+   request.action = action;
+   request.symbol = symbol;
+   request.type_filling = ORDER_FILLING_IOC;
+
+
+   if (action != TRADE_ACTION_SLTP)
+   {
+      request.volume = customVolume;
+      request.type = type;
+      request.magic = 123456;
+
+      request.price = (_initial_ordered)
+         ? price
+         : (type == ORDER_TYPE_BUY || type == ORDER_TYPE_BUY_STOP)
+           ? SymbolInfoDouble(symbol, SYMBOL_ASK)
+           : SymbolInfoDouble(symbol, SYMBOL_BID);
+   }
+
+   OrderSend(request, result);
+   return result;
+}
+
+
+
+
+MqlTradeResult SetTpSl(ulong order, double price, int ordertype)
+{
+   last_order = order;
+
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   request.action = TRADE_ACTION_SLTP;
+   request.position = order;
+
+   if (ordertype == 0)  // BUY
+   {
+      request.sl = NormalizeDouble(price - sl, precision);
+      request.tp = NormalizeDouble(price + tp, precision);
+   }
+   else  // SELL
+   {
+      request.sl = NormalizeDouble(price + sl, precision);
+      request.tp = NormalizeDouble(price - tp, precision);
+   }
+
+   if (!OrderSend(request, result))
+   {
+      Print("❌ SL/TP OrderSend failed: ", GetLastError());
+   }
+   else if (result.retcode != TRADE_RETCODE_DONE)
+   {
+      Print("❌ SL/TP request error: ", result.retcode, " - ", result.comment);
+   }
+   else
+   {
+      Print("✅ SL/TP set successfully for order: ", order);
+   }
+
+   return result;
+}
+
+bool IsTphit(ulong positionTicket)
+{
+   if (!HistorySelect(TimeCurrent() - 3600, TimeCurrent()))
+      return false;
+
+   int totalDeals = HistoryDealsTotal();
+   for (int i = totalDeals - 1; i >= 0; i--)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      ulong posId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      if (posId == positionTicket)
+      {
+         double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+         long entryType = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+         if (entryType == DEAL_ENTRY_OUT && profit > 0)
+            return true;
+      }
+   }
+   return false;
+}
+
+void Setter()
+{
+   closecode = false;
+   volumeIndex = 0;
+}
+
+
+bool Initial_setter_success()
+{
+   if (OrdersTotal() == 0 && PositionsTotal() == 0)
+   {
+      p_orders = 0;
+      p_position = 0;
+      volumeIndex = 0;
+      return true;
+   }
+   return false;
+}
+
+bool PendingOrderExists(ENUM_ORDER_TYPE type, double price)
+{
+   int total = OrdersTotal();
+   for (int i = 0; i < total; i++)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if (OrderSelect(ticket))
+
+      {
+         ENUM_ORDER_TYPE existingType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         double existingPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+         if (existingType == type && MathAbs(existingPrice - price) < (_Point * 5) && OrderGetInteger(ORDER_MAGIC) == 123456)
+            return true;
+      }
+   }
+   return false;
+}
+void AdjustVolumeSequence()
+{
+   double baseLot = 0.01;
+   for (int i = 0; i < ArraySize(volumeSequence); i++)
+   {
+      volumeSequence[i] = baseLot * MathPow(2, i);
+
+   }
+}
+
+int OnInit()
+{
+   if (TimeCurrent() > StringToTime(ExpiryDate))
+   {
+      Alert("⛔ EA expired on ", ExpiryDate);
+      ExpertRemove();
+      return(INIT_FAILED);
+   }
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Check if current time is within trading window (IST)            |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+{
+   MqlDateTime timeStruct;
+   TimeToStruct(TimeLocal(), timeStruct);  // Get local time (IST if your PC is in IST)
+
+   int hour = timeStruct.hour;
+   int minute = timeStruct.min;
+   int totalMinutes = hour * 60 + minute;
+
+   int startTime = 8 * 60;       // 08:00 AM = 480 minutes
+   int endTime   = 20 * 60 + 30; // 08:30 PM = 1230 minutes
+
+   return (totalMinutes >= startTime && totalMinutes <= endTime);
+}
+
+void OnTick()
+{
+   
+   bool allowNewTrades = IsTradingTime();
+    
+
+      if (!IsTradingTime() && startedtrade==false)
+   {
+    
+      Print("⛔ Outside trading hours — skipping trading logic.");
+      return;  // Stop EA from placing any trades or pending orders
+   }
+
+   // ✅ STEP 1: Setup RSI if not already done
+   if (rsiHandle == INVALID_HANDLE)
+   {
+      AdjustVolumeSequence();
+      rsiHandle = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, RSI_Price);
+      if (rsiHandle == INVALID_HANDLE)
+      {
+         Print("❌ Failed to create RSI handle. Error: ", GetLastError());
+         return;
+      }
+   }
+
+   // ✅ STEP 2: Read RSI value
+   double rsiBuffer[];
+   if (CopyBuffer(rsiHandle, 0, 0, 1, rsiBuffer) > 0)
+      rsiValue = rsiBuffer[0];
+   else
+      return;
+
+   // ✅ STEP 3: Floating Profit Check
+   double floatingProfit = GetTotalProfit();
+   if (floatingProfit >= ProfitTarget)
+{
+   Print("💰 Floating profit $", DoubleToString(floatingProfit, 2), " reached target.");
+   CloseAllTrades();         // ✅ Closes both positions & pending
+   _initial_ordered = false;
+   volumeIndex = 0;
+   return;
+}
+
+
+   Comment("\n🟢 Trades Executed: ", total_trades,
+           "\n🎯 Profit Target: $", DoubleToString(ProfitTarget, 2));
+
+   // ✅ STEP 4: Initial Entry Logic
+   if (!_initial_ordered)
+   {
+      startedtrade = true;
+      if (Initial_setter_success())
+      {
+         if (rsiValue < RSI_Oversold)
+         {
+            PlacePendingOrder(TRADE_ACTION_DEAL, ORDER_TYPE_BUY, currency, 0.0, 0);
+            _initial_ordered = true;
+         }
+         else if (rsiValue > RSI_Overbought)
+         {
+            PlacePendingOrder(TRADE_ACTION_DEAL, ORDER_TYPE_SELL, currency, 0.0, 0);
+            _initial_ordered = true;
+         }
+      }
+   }
+   else
+   {
+      int c_orders = OrdersTotal();
+      int c_positions = PositionsTotal();
+
+      if (c_positions < p_position)
+      {
+         if (IsTphit(last_order))
+{
+   Print("✅ TP hit — closing all trades and resetting.");
+   CloseAllTrades();
+   startedtrade = false;
+   _initial_ordered = false;
+   volumeIndex = 0;
+}
+
+      }
+
+      if (c_positions > p_position)
+      {
+         datetime latestTime = 0;
+         int latestIndex = -1;
+
+         for (int i = 0; i < c_positions; i++)
+         {
+            ulong ticket = PositionGetTicket(i);
+            if (PositionSelectByTicket(ticket))
+            {
+               datetime posTime = (datetime)PositionGetInteger(POSITION_TIME);
+               if (posTime > latestTime)
+               {
+                  latestTime = posTime;
+                  latestIndex = i;
+               }
+            }
+         }
+
+         if (latestIndex >= 0)
+         {
+            ulong ticket = PositionGetTicket(latestIndex);
+            if (PositionSelectByTicket(ticket))
+            {
+               double pricebought = PositionGetDouble(POSITION_PRICE_OPEN);
+               ENUM_POSITION_TYPE ordertype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+               double sl2 = PositionGetDouble(POSITION_SL);
+
+               if (sl2 == 0.0)
+               {
+                  SetTpSl(ticket, pricebought, ordertype);
+                  if (volumeIndex < ArraySize(volumeSequence) - 1)
+                     volumeIndex++;
+               }
+
+               double nextVolume = volumeSequence[volumeIndex];
+
+               if (ordertype == POSITION_TYPE_SELL)
+               {
+                  double buyStopPrice = NormalizeDouble(pricebought + changer, _Digits);
+                  if (!PendingOrderExists(ORDER_TYPE_BUY_STOP, buyStopPrice))
+                  {
+                     PlacePendingOrderWithCustomVolume(TRADE_ACTION_PENDING, ORDER_TYPE_BUY_STOP, currency, buyStopPrice, ticket, nextVolume);
+                  }
+               }
+               else if (ordertype == POSITION_TYPE_BUY)
+               {
+                  double sellStopPrice = NormalizeDouble(pricebought - changer, _Digits);
+                  if (!PendingOrderExists(ORDER_TYPE_SELL_STOP, sellStopPrice))
+                  {
+                     PlacePendingOrderWithCustomVolume(TRADE_ACTION_PENDING, ORDER_TYPE_SELL_STOP, currency, sellStopPrice, ticket, nextVolume);
+                  }
+               }
+            }
+         }
+      }
+         if (c_positions == 0 && c_orders > 0)
+{
+   if (IsTradingTime())
+   {
+      Print("📦 No open positions but pending orders exist — cleaning.");
+      Closeallorders();             // ✅ Delete only during trading hours
+      _initial_ordered = false;
+   }
+   else
+   {
+      Print("⏳ Outside trading hours — keeping existing pending orders.");
+      // ✅ Do nothing — let pending orders stay untouched
+   }
+}
+
+
+      p_orders = c_orders;
+      p_position = c_positions;
+
+      if (c_positions == 0 && c_orders == 0)
+      {
+         _initial_ordered = false;
+         volumeIndex = 0;
+      }
+   }
+}
